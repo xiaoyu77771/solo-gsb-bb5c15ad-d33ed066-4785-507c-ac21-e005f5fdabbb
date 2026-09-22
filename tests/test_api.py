@@ -820,3 +820,166 @@ def test_replay_after_profile_still_readonly(client):
     listing = client.get(base + "/profiles").json()
     assert listing["total"] == 1
     assert listing["items"][0]["total_documents"] == 1
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/mutation-coverage 样本变异覆盖评估
+# ---------------------------------------------------------------------------
+
+MUTATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["active", "disabled", "pending"]},
+        "age": {"type": "integer", "minimum": 0, "maximum": 100},
+        "tags": {"type": "array", "minItems": 1,
+                 "items": {"type": "string", "maxLength": 8}},
+    },
+    "required": ["status", "age"],
+}
+
+
+def _mutation_analysis(client):
+    return _create(client, {"type": "object"}, MUTATION_SCHEMA, "mutation-case")
+
+
+def test_mutation_coverage_scores_and_uncovered_paths(client):
+    analysis = _mutation_analysis(client)
+    documents = [
+        {"status": "pending", "age": 0, "tags": ["ok"]},      # 杀 pending 枚举 / minimum
+        {"status": "active", "age": 100, "tags": ["x"]},      # 杀 active 枚举 / maximum
+        {"status": "active", "tags": ["x"]},                  # 负向：缺 age
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/mutation-coverage",
+                       json={"documents": documents})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["analysis_id"] == analysis["id"]
+    assert data["total_documents"] == 3
+    assert data["valid_documents"] == 2
+    assert data["invalid_documents"] == 1
+    assert data["total_mutations"] == data["killed_mutations"] \
+        + data["surviving_mutations"]
+    assert 0 < data["mutation_score"] < 1
+
+    rules = {r["rule"]: r for r in data["rules"]}
+    assert rules["enum_narrowed"]["killed"] == 2
+    assert rules["enum_narrowed"]["surviving"] == 1
+    assert rules["minimum_increased"]["killed"] == 1
+    assert rules["maximum_decreased"]["killed"] == 1
+    # 缺 age 的负向样本杀死 required_removed(age)；没有缺 status 的样本
+    required = rules["required_removed"]
+    assert required["killed"] == 1 and required["surviving"] == 1
+
+    # 未覆盖变异路径与示例索引
+    surviving_disabled = [
+        m for m in data["mutants"]
+        if m["rule"] == "enum_narrowed" and not m["killed"]
+    ]
+    assert len(surviving_disabled) == 1
+    assert surviving_disabled[0]["subject"] == '"disabled"'
+    assert surviving_disabled[0]["pointer"] == "#/properties/status"
+    assert surviving_disabled[0]["example_indices"] == []
+    assert surviving_disabled[0]["pointer"] in data["uncovered_paths"]
+
+    killed_age = next(m for m in data["mutants"]
+                      if m["rule"] == "required_removed" and m["subject"] == "age")
+    assert killed_age["killed"] is True
+    assert killed_age["example_indices"] == [2]
+
+    # 每个变异体都有稳定 ID 与确定性描述
+    for mutant in data["mutants"]:
+        assert len(mutant["id"]) == 12
+        assert mutant["pointer"].startswith("#")
+        assert mutant["description"]
+
+    # limits 回填缺省值
+    assert data["limits"]["enum_narrowed"] == 50
+
+
+def test_mutation_coverage_per_rule_limits(client):
+    analysis = _mutation_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/mutation-coverage"
+
+    # 关闭 required_removed，只保留 1 个枚举变异
+    resp = client.post(base, json={
+        "documents": [{"status": "pending", "age": 1}],
+        "max_per_rule": {"required_removed": 0, "enum_narrowed": 1},
+    })
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    rules = {r["rule"]: r for r in data["rules"]}
+    assert rules["required_removed"]["total"] == 0
+    assert rules["enum_narrowed"]["total"] == 1
+    assert data["limits"]["required_removed"] == 0
+    assert data["limits"]["enum_narrowed"] == 1
+    # 未声明的规则仍为缺省上限
+    assert data["limits"]["minimum_increased"] == 50
+
+
+def test_mutation_coverage_is_readonly_and_deterministic(client):
+    analysis = _mutation_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/mutation-coverage"
+    payload = {"documents": [
+        {"status": "pending", "age": 0, "tags": ["ok"]},
+        {"status": "active"},
+    ]}
+
+    first = client.post(base, json=payload)
+    assert first.status_code == 200, first.text
+    second = client.post(base, json=payload)
+    assert second.json() == first.json()
+
+    # 不修改分析记录，也不产生画像快照
+    after = client.get(f"/api/analyses/{analysis['id']}").json()
+    assert after["report"] == analysis["report"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert client.get(f"/api/analyses/{analysis['id']}/profiles").json()["total"] == 0
+
+
+def test_mutation_coverage_accepts_non_object_documents(client):
+    analysis = _mutation_analysis(client)
+    # 与画像接口不同：变异评估接受任意 JSON 类型文档（根 schema 无 type 时）
+    loose = _create(
+        client,
+        {"type": "object"},
+        {"type": "object", "properties": {"a": {"enum": [1, 2]}},
+         "required": ["a"]},
+    )
+    resp = client.post(f"/api/analyses/{loose['id']}/mutation-coverage",
+                       json={"documents": [1, "str", None, True, [], {"a": 1}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_documents"] == 6
+    assert data["valid_documents"] + data["invalid_documents"] == 6
+
+
+def test_mutation_coverage_validation_errors(client):
+    analysis = _mutation_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/mutation-coverage"
+
+    # 空文档列表 -> 422
+    assert client.post(base, json={"documents": []}).status_code == 422
+    # 缺少 documents 字段 -> 422
+    assert client.post(base, json={}).status_code == 422
+    # 超过文档上限 -> 422
+    assert client.post(base, json={"documents": [{}] * 5001}).status_code == 422
+    # 未知变异规则 -> 422
+    resp = client.post(base, json={
+        "documents": [{"status": "active", "age": 1}],
+        "max_per_rule": {"not_a_rule": 10},
+    })
+    assert resp.status_code == 422
+    # 负的上限 -> 422
+    resp = client.post(base, json={
+        "documents": [{"status": "active", "age": 1}],
+        "max_per_rule": {"enum_narrowed": -1},
+    })
+    assert resp.status_code == 422
+
+
+def test_mutation_coverage_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/mutation-coverage",
+                       json={"documents": [{}]})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"

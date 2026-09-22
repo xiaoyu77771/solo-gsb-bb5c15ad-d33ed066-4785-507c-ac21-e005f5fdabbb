@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
 
@@ -383,4 +384,112 @@ class ReplayResponse(BaseModel):
     )
     unattributed: list[ReplayUnattributedError] = Field(
         ..., description="无法归因到报告 issue 的校验错误分组"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/mutation-coverage 样本变异覆盖评估
+# ---------------------------------------------------------------------------
+
+
+MutationRuleName = Literal[
+    "required_removed",
+    "enum_narrowed",
+    "minimum_increased",
+    "maximum_decreased",
+    "type_narrowed",
+    "min_length_increased",
+    "max_length_decreased",
+    "min_items_increased",
+    "max_items_decreased",
+    "min_properties_increased",
+    "max_properties_decreased",
+]
+
+
+class MutationCoverageRequest(BaseModel):
+    """POST /api/analyses/{id}/mutation-coverage 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_MUTATION_DOCUMENTS,
+        description=(
+            f"待评估的 JSON 文档列表（任意 JSON 类型；既可用正向样本发现"
+            f"收紧类变异，也可用缺少必填项等负向样本发现放松类变异），"
+            f"数量 1..{MAX_MUTATION_DOCUMENTS}"
+        ),
+    )
+    max_per_rule: dict[MutationRuleName, int] | None = Field(
+        default=None,
+        description=(
+            "每类变异的生成上限；未声明的规则使用缺省上限 50，"
+            "显式传 0 表示关闭该类变异"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_limits(self):
+        if self.max_per_rule:
+            unknown = set(self.max_per_rule) - set(RULE_NAMES)
+            if unknown:
+                raise ValueError(f"未知变异规则: {sorted(unknown)}")
+            for rule, value in self.max_per_rule.items():
+                if value < 0:
+                    raise ValueError(f"max_per_rule.{rule} 不能为负数")
+                if value > MAX_RULE_LIMIT:
+                    raise ValueError(
+                        f"max_per_rule.{rule} 不能超过 {MAX_RULE_LIMIT}"
+                    )
+        return self
+
+
+class MutationRuleScore(BaseModel):
+    """按变异规则分类的覆盖率统计。"""
+
+    rule: MutationRuleName
+    total: int = Field(..., ge=0, description="该类实际生成的变异体数量（已按上限截断）")
+    killed: int = Field(..., ge=0, description="被样本杀死（被某文档校验结果差异发现）的数量")
+    surviving: int = Field(..., ge=0, description="未被任何样本发现的存活变异体数量")
+    mutation_score: float | None = Field(
+        ..., description="该类 mutation score = killed / total；该类无变异体时为 null"
+    )
+
+
+class MutationResult(BaseModel):
+    """单个变异体的评估结果。"""
+
+    id: str = Field(..., description="变异体稳定 ID（规则 + 路径 + 主体的 SHA-256 前 12 位）")
+    rule: MutationRuleName
+    pointer: str = Field(..., description="变异施加的 schema 节点位置（JSON Pointer，根为 #）")
+    subject: str = Field(..., description="变异主体（必填字段名 / 被删枚举值 / 被删类型 / 关键字名）")
+    description: str = Field(..., description="确定性的单点变异说明")
+    killed: bool = Field(..., description="是否被提交的样本发现（原/异 schema 校验结果不同）")
+    example_indices: list[int] = Field(
+        ..., description="杀死该变异体的示例文档下标（基于提交顺序，从 0 开始，升序且有界）"
+    )
+
+
+class MutationCoverageResponse(BaseModel):
+    """样本变异覆盖评估结果（接口只读，不持久化）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    valid_documents: int = Field(..., ge=0, description="通过原新 schema 校验的文档数")
+    invalid_documents: int = Field(..., ge=0, description="被原新 schema 拒绝的文档数（可发现放松类变异）")
+    total_mutations: int = Field(..., ge=0)
+    killed_mutations: int = Field(..., ge=0)
+    surviving_mutations: int = Field(..., ge=0)
+    mutation_score: float = Field(..., description="总体 mutation score = killed / total；无变异体时为 1.0")
+    limits: dict[MutationRuleName, int] = Field(
+        ..., description="本次评估各类变异实际生效的生成上限（缺省规则回填为 50）"
+    )
+    rules: list[MutationRuleScore] = Field(
+        ..., description="按规则分类的 mutation score，顺序固定"
+    )
+    mutants: list[MutationResult] = Field(
+        ..., description="全部变异体的逐变异评估结果，按 (规则, 路径, 主体, ID) 排序"
+    )
+    uncovered_paths: list[str] = Field(
+        ..., description="未被样本覆盖的变异路径（存活变异体的 schema 指针，可能重复）"
     )

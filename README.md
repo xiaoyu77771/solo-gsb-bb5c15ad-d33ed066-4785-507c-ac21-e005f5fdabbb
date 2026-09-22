@@ -17,10 +17,11 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、变异覆盖评估
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
+│   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -31,6 +32,7 @@
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
+│   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -78,7 +80,57 @@ docker compose logs -f
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok"}
+
+# 打开 Swagger UI 可直接调试全部接口（含变异覆盖评估）
+# http://localhost:8000/docs
 ```
+
+启动后可用一条脚本快速走通"创建分析 → 变异覆盖评估"：
+
+```bash
+# 1) 创建分析（旧版无约束 -> 新版必填 status/age 且枚举与范围收紧）
+ID=$(curl -s -X POST http://localhost:8000/api/analyses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "old_schema": {"type": "object"},
+    "new_schema": {
+      "type": "object",
+      "properties": {
+        "status": {"type": "string", "enum": ["active", "disabled", "pending"]},
+        "age": {"type": "integer", "minimum": 0, "maximum": 100}
+      },
+      "required": ["status", "age"]
+    }
+  }' | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+# 2) 对新 schema 做样本变异覆盖评估
+curl -s -X POST "http://localhost:8000/api/analyses/$ID/mutation-coverage" \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"status": "pending", "age": 0},
+    {"status": "active", "age": 100},
+    {"status": "active"}
+  ]}' | python3 -m json.tool
+```
+
+容器内测试（可选）：仓库自带的接口与引擎测试不会打进镜像；本地源码目录下
+可直接运行（需要 Python 3.11+ 与开发依赖）：
+
+```bash
+pip install -r requirements.txt pytest httpx
+pytest -q
+```
+
+### 常见启动问题
+
+- **端口被占用**：宿主机 8000 端口已被其他进程使用时，修改
+  `docker-compose.yml` 中 `"8000:8000"` 的左侧端口（如 `"18000:8000"`），
+  或 `docker run` 时改用 `-p 18000:8000`；
+- **容器一直 unhealthy / 立即退出**：`docker compose logs api` 查看日志；
+  常见原因是数据卷权限或旧版数据库文件与当前 SQLAlchemy 模型不匹配
+  （开发环境可用 `docker compose down -v` 清卷重建，**会清空历史数据**）；
+- **镜像内代码未更新**：改了 `app/` 代码后需 `docker compose up --build`
+  重新构建（镜像只 COPY `app` 目录，不挂载源码卷）。
 
 ### 数据持久化
 
@@ -859,6 +911,127 @@ curl -X POST http://localhost:8000/api/analyses/1/replay \
 
 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
 
+### `POST /api/analyses/{id}/mutation-coverage` — 样本变异覆盖评估
+
+针对分析记录保存的**新 schema**（`new_schema`）**确定性地生成一批单点
+变异体（mutants）**，再用提交的待评估文档逐个校验：同一文档在原 schema
+与变异体上的校验结果不同，即该变异体被样本"杀死"。接口为**纯只读**
+操作：不修改分析报告、不追加画像快照、不写任何历史；分析编号不存在
+返回 `404`。
+
+请求体：
+
+| 字段            | 类型     | 必填 | 说明                                                |
+| --------------- | -------- | ---- | --------------------------------------------------- |
+| `documents`     | any[]    | 是   | 待评估 JSON 文档列表（任意类型），数量 1..5000      |
+| `max_per_rule`  | object   | 否   | 每类变异的生成上限；缺省每类 50，传 `0` 关闭该类变异 |
+
+生成的变异规则（每个变异体只改动 schema 的**一处**约束）：
+
+| 规则（rule）                  | 变异内容                       | 方向   |
+| ----------------------------- | ------------------------------ | ------ |
+| `required_removed`            | 删除一个必填字段               | 放松   |
+| `enum_narrowed`               | 枚举删除一个取值               | 收紧   |
+| `minimum_increased`           | 数值下界提高（含排他边界）     | 收紧   |
+| `maximum_decreased`           | 数值上界降低（含排他边界）     | 收紧   |
+| `type_narrowed`               | 多类型声明删除一个类型         | 收紧   |
+| `min_length_increased`        | 字符串最短长度 +1              | 收紧   |
+| `max_length_decreased`        | 字符串最长长度 -1              | 收紧   |
+| `min_items_increased`         | 数组最少元素数 +1              | 收紧   |
+| `max_items_decreased`         | 数组最多元素数 -1              | 收紧   |
+| `min_properties_increased`    | 对象最少属性数 +1              | 收紧   |
+| `max_properties_decreased`    | 对象最多属性数 -1              | 收紧   |
+
+变异在 `$ref` 预解析后的 schema 上生成，覆盖对象属性、齐次/元组数组、
+`anyOf` / `oneOf` / `allOf` 分支与 `then` / `else` 子 schema；不改变
+`not` / `if` 内层约束（方向会反转）与未内联的 `$defs` 副本。**等价
+变异**（删除后不改变校验语义，如 `["integer","number"]` 删除
+`integer`）会在变异节点局部用区分见证双向校验后剔除，不计入分母。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {"status": "pending", "age": 0},
+      {"status": "active", "age": 100},
+      {"status": "active"}
+    ],
+    "max_per_rule": {"enum_narrowed": 10}
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 3,
+  "valid_documents": 2,
+  "invalid_documents": 1,
+  "total_mutations": 8,
+  "killed_mutations": 6,
+  "surviving_mutations": 2,
+  "mutation_score": 0.75,
+  "limits": { "required_removed": 50, "enum_narrowed": 10, "minimum_increased": 50, "...": 50 },
+  "rules": [
+    { "rule": "required_removed", "total": 2, "killed": 1,
+      "surviving": 1, "mutation_score": 0.5 },
+    { "rule": "enum_narrowed", "total": 3, "killed": 2,
+      "surviving": 1, "mutation_score": 0.6666666666666666 },
+    { "rule": "minimum_increased", "total": 1, "killed": 1,
+      "surviving": 0, "mutation_score": 1.0 },
+    { "rule": "max_length_decreased", "total": 0, "killed": 0,
+      "surviving": 0, "mutation_score": null }
+  ],
+  "mutants": [
+    {
+      "id": "d9cfcfa78d76",
+      "rule": "enum_narrowed",
+      "pointer": "#/properties/status",
+      "subject": "\"pending\"",
+      "description": "枚举收窄：删除取值 \"pending\"",
+      "killed": true,
+      "example_indices": [0]
+    },
+    {
+      "id": "13f4ce505949",
+      "rule": "required_removed",
+      "pointer": "#",
+      "subject": "status",
+      "description": "删除必填字段 \"status\"（required 移除该项）",
+      "killed": false,
+      "example_indices": []
+    }
+  ],
+  "uncovered_paths": ["#/properties/status", "#"]
+}
+```
+
+响应字段：
+
+| 字段                          | 说明                                                            |
+| ----------------------------- | --------------------------------------------------------------- |
+| `mutation_score`              | 总体变异覆盖率 = `killed_mutations / total_mutations`；无变异体时为 `1.0` |
+| `valid_documents` / `invalid_documents` | 通过 / 被原新 schema 拒绝的文档数；放松类变异由后者发现  |
+| `rules[]`                     | **按规则分类**的统计：每类的变异数、杀死数、存活数与分类 score；该类无变异体时 score 为 `null` |
+| `limits`                      | 本次评估各类变异实际生效的生成上限（缺省规则回填为 50）         |
+| `mutants[]`                   | 全部变异体的逐变异结果，按 (规则, 路径, 主体, ID) 确定性排序    |
+| `mutants[].id`                | 变异体稳定 ID：`rule + 节点指针 + 变异主体` 的 SHA-256 前 12 位 |
+| `mutants[].pointer`           | 变异施加的 schema 节点位置（JSON Pointer，根为 `#`）            |
+| `mutants[].subject`           | 变异主体：必填字段名 / 被删枚举值 / 被删类型 / 关键字名         |
+| `mutants[].killed`            | 是否被提交样本发现（原 / 异 schema 校验结果不同）               |
+| `mutants[].example_indices`   | 杀死该变异体的示例文档下标（从 0 开始，升序，最多保留 20 个）   |
+| `uncovered_paths`             | **未覆盖变异路径**：所有存活变异体的 schema 指针（可能重复）    |
+
+收紧类变异（枚举收窄、范围收紧等）由**原 schema 合法、变异后被拒绝**
+的文档发现；放松类变异（删除必填项）由**原 schema 拒绝、变异后合法**
+的负向文档发现（如恰好缺少该必填字段的脏数据），因此提交的样本集
+越能代表真实数据的边界取值，mutation score 越能反映样本的规则覆盖能力。
+
+入参为空列表、超过 5000 个文档、缺少 `documents` 字段、`max_per_rule`
+含未知规则名或负数（超过 10000）时返回 `422`。
+
 ### `GET /health`
 
 ```json
@@ -903,3 +1076,13 @@ curl -X POST http://localhost:8000/api/analyses/1/replay \
 替换为"rest + 激活分支"的构造用 schema，按激活单元派生子比较；子比较
 构造反例时会按需强制实例满足 / 违反对应的 `if`，并启用验证门禁——
 只有经验证的反例才记 `error`，否则统一降级 `warning`。
+
+变异覆盖评估（`mutation.py`）是上述只读分析链路的补充：它不比较两版
+schema，而是对**新 schema 自身**做单点变异——`$ref` 预解析后递归遍历
+对象、数组、组合分支与条件分支，在每个 schema 节点上按声明的关键字
+确定性地产出"删除必填项 / 收窄枚举 / 收紧数值与长度范围 / 收窄类型"
+等变异描述，先在节点局部用区分见证剔除等价变异、再按每类上限稳定
+截断；随后逐变异地把单点编辑施加到 schema 深拷贝上，用 `jsonschema`
+对每篇文档比对原 / 异校验结果，汇总出按规则分类的 mutation score、
+未覆盖变异路径与杀死变异的样例下标。整个评估无随机源、不依赖文档
+顺序，也不产生任何持久化写入。
