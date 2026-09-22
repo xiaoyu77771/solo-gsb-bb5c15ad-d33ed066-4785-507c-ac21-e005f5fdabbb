@@ -17,10 +17,11 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、样本变异覆盖评估
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
+│   ├── mutation.py      # 样本变异覆盖评估（新 schema 确定性单点变异生成 + 合法性差分 + 按规则 mutation score）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
 │   ├── gate.py          # 发布门禁（方向阈值、warning 上限、issue 豁免规则）
@@ -31,6 +32,7 @@
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
+│   ├── test_mutation.py # 样本变异覆盖引擎单元测试（九类单点变异 / 差分杀死 / 上限截断 / 确定性）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
 │   └── test_api.py      # 接口端到端测试
@@ -79,6 +81,65 @@ docker compose logs -f
 curl http://localhost:8000/health
 # {"status":"ok"}
 ```
+
+### 容器启动后的接口冒烟测试
+
+容器起来后可以用 `curl` 走一遍核心接口（使用临时容器执行，不影响运行
+中的服务）：
+
+```bash
+# 1. 创建一次分析（记录返回 JSON 中的 id，下文以 1 为例）
+curl -s -X POST http://localhost:8000/api/analyses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "smoke",
+    "old_schema": {"type": "object",
+                   "properties": {"status": {"enum": ["active", "pending"]}}},
+    "new_schema": {"type": "object",
+                   "properties": {"status": {"enum": ["active"]},
+                                  "owner": {"type": "string"}},
+                   "required": ["status", "owner"]}
+  }'
+
+# 2. 拉取完整报告
+curl -s http://localhost:8000/api/analyses/1 | head -c 400
+
+# 3. 样本回放诊断
+curl -s -X POST http://localhost:8000/api/analyses/1/replay \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [{"status": "pending"}, {"status": "active", "owner": "me"}]}'
+
+# 4. 样本变异覆盖评估（对新 schema 生成单点变异）
+curl -s -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [{"status": "active", "owner": "me"}, {"owner": "x"}],
+       "max_mutations": {"enum_narrowed": 5}}'
+
+# 5. 导出 SARIF
+curl -s http://localhost:8000/api/analyses/1/sarif -o /tmp/report.sarif
+```
+
+非法入参（空文档列表、未知变异规则名、负的变异上限等）会返回 `4xx`：
+
+```bash
+curl -i -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [], "max_mutations": {"nope": -1}}'
+# HTTP/1.1 422 Unprocessable Entity
+```
+
+在容器内运行**完整自动化测试**（镜像默认只打包 `app/`，这里把 tests
+目录挂载进运行中的容器，并临时安装测试依赖，不修改镜像、不影响服务）：
+
+```bash
+docker compose exec -v "$PWD/tests:/app/tests" api \
+  sh -c 'pip install --no-cache-dir pytest httpx && python -m pytest -q'
+```
+
+> 提示：`docker compose exec -v` 需要 Docker Compose v2.16+；旧版本可
+> 改用 `docker cp tests schema-compat-api:/app/tests` 后再
+> `docker compose exec api sh -c 'pip install -q pytest httpx && python -m pytest -q'`。
+> 本地直接运行测试见下文「本地运行」一节。
 
 ### 数据持久化
 
@@ -858,6 +919,148 @@ curl -X POST http://localhost:8000/api/analyses/1/replay \
   跨节点的模糊回退，避免错误归因。
 
 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
+
+### `POST /api/analyses/{id}/mutation-coverage` — 样本变异覆盖评估
+
+针对分析记录保存的**新 schema** 确定性地生成一批**单点变异**（mutant），
+用提交的待评估文档（最多 **5000** 个，支持任意 JSON 类型）逐变异校验，
+统计这批样例能"发现"多少变异——即**变异测试（mutation testing）**视角下
+的样本覆盖质量。接口为**纯只读**操作：不修改分析报告、不追加画像快照；
+分析编号不存在返回 `404`。
+
+生成的变异每一个都只改动 schema 的一个关键字位置，共九类规则：
+
+| 规则 `rule` | 单点变异做法 |
+| ----------- | ------------ |
+| `required_removed` | 删除一个必填字段（放松约束；删空时整段 `required` 移除） |
+| `required_added` | 把一个已声明但非必填的属性加入 `required`（收紧约束） |
+| `enum_narrowed` | 从 `enum` 中移除一个取值（每个取值一个变异） |
+| `minimum_raised` | 数值下界抬升 1（`minimum`，缺省时收紧数值型 `exclusiveMinimum`） |
+| `maximum_lowered` | 数值上界压低 1（`maximum`，缺省时收紧数值型 `exclusiveMaximum`） |
+| `min_length_increased` | 字符串 `minLength` 加 1 |
+| `max_length_decreased` | 字符串 `maxLength` 减 1（值为 0 时不生成） |
+| `min_items_increased` | 数组 `minItems` 加 1 |
+| `max_items_decreased` | 数组 `maxItems` 减 1（值为 0 时不生成） |
+
+变异生成完全确定性：文档内 `$ref` 先预解析内联（`$defs` 中未被引用的
+子树不重复变异），属性名 / 枚举值按规范化 JSON 固定排序，每类规则
+最多生成的变异数可由 `max_mutations` 逐类指定（缺省 **50**，最大
+**1000**，`0` 表示跳过该类）。
+
+**杀死判定（合法性对称差分）**：对每篇文档比较它在**原 schema** 与
+**变异 schema** 下的校验结果，只要存在任一文档的合法性发生翻转，
+该变异即被样例**发现（killed）**：
+
+- 原合法、变异拒绝——收紧型变异被踩边界的合法样本发现；
+- 原拒绝、变异接受——放松型变异被原本非法的样本发现。
+
+请求体：
+
+| 字段 | 类型 | 必填 | 说明 |
+| ---- | ---- | ---- | ---- |
+| `documents` | any[] | 是 | 待评估 JSON 文档列表，数量 1..5000（任意类型） |
+| `max_mutations` | object | 否 | 每类变异规则的生成上限，键为上表规则名，值为 0..1000 的整数 |
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/mutation-coverage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "documents": [
+      {"status": "active", "age": 30},
+      {"status": "pending", "age": 0},
+      {"age": 1}
+    ],
+    "max_mutations": {"enum_narrowed": 10}
+  }'
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 3,
+  "valid_documents": 2,
+  "invalid_documents": 1,
+  "total_mutations": 6,
+  "killed_mutations": 5,
+  "survived_mutations": 1,
+  "mutation_score": 0.8333333333333334,
+  "rules": [
+    {
+      "rule": "required_removed",
+      "generated": 2, "killed": 1, "survived": 1,
+      "mutation_score": 0.5, "cap": 50
+    },
+    {
+      "rule": "enum_narrowed",
+      "generated": 2, "killed": 2, "survived": 0,
+      "mutation_score": 1.0, "cap": 10
+    },
+    {
+      "rule": "minimum_raised",
+      "generated": 1, "killed": 1, "survived": 0,
+      "mutation_score": 1.0, "cap": 50
+    }
+  ],
+  "mutations": [
+    {
+      "rule": "required_removed",
+      "path": "#",
+      "description": "移除必填字段 'age'",
+      "killed": false,
+      "sample_indices": []
+    },
+    {
+      "rule": "required_removed",
+      "path": "#",
+      "description": "移除必填字段 'status'",
+      "killed": true,
+      "sample_indices": [2]
+    },
+    {
+      "rule": "enum_narrowed",
+      "path": "#/properties/status",
+      "description": "从枚举中移除取值 \"active\"",
+      "killed": true,
+      "sample_indices": [0]
+    },
+    {
+      "rule": "minimum_raised",
+      "path": "#/properties/age",
+      "description": "将数值下界 minimum 由 0 收紧为 1",
+      "killed": true,
+      "sample_indices": [1]
+    }
+  ],
+  "uncovered": [
+    {
+      "rule": "required_removed",
+      "path": "#",
+      "description": "移除必填字段 'age'"
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `mutation_score` | 整体变异发现率 = `killed_mutations / total_mutations`（无变异时为 `0.0`） |
+| `rules[]` | 按规则分类的发现率（仅包含实际生成过变异的规则），含本次使用的 `cap` |
+| `mutations[]` | 全部变异的逐变异结果，按（规则声明顺序 → `path` → 描述）确定排序 |
+| `mutations[].path` | 变异施加位置（schema JSON Pointer，如 `#/properties/age`） |
+| `mutations[].killed` | 是否被待评估文档发现（合法性发生翻转） |
+| `mutations[].sample_indices` | 发现该变异的样例下标（从 0 开始，升序，最多保留 20 个） |
+| `uncovered[]` | **未覆盖变异**清单：未被任何样例发现的变异及其规则 / schema 路径 / 说明 |
+
+`uncovered` 即样本集的盲点清单——这些位置的单点收紧 / 放松没有任何样例
+踩到，可据此补充边界样本（如枚举取值、恰好等于 `minimum/maximum` 的值、
+缺字段的非法文档等）。同一请求重复调用结果完全一致（确定性，无副作用）。
+
+入参为空列表、超过 5000 个文档、缺少 `documents` 字段，或
+`max_mutations` 含未知规则名、负数、超过 1000 的上限时返回 `422`。
 
 ### `GET /health`
 

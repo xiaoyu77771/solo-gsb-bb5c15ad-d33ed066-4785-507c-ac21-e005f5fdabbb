@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, gate, profile, replay, sarif
+from app import compat, compare, gate, mutation, profile, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -18,6 +18,8 @@ from app.schemas import (
     CompareResponse,
     GateRequest,
     GateResponse,
+    MutationCoverageRequest,
+    MutationCoverageResponse,
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
@@ -177,6 +179,26 @@ def replay_analysis(analysis_id: int, payload: ReplayRequest, db: Session = Depe
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
     result = replay.replay_documents(
         row.old_schema, row.new_schema, row.report, payload.documents
+    )
+    return {"analysis_id": analysis_id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/mutation-coverage",
+    response_model=MutationCoverageResponse,
+    tags=["analyses"],
+    summary="样本变异覆盖评估：对新 schema 生成单点变异并统计样例发现率",
+)
+def mutation_coverage(analysis_id: int, payload: MutationCoverageRequest,
+                      db: Session = Depends(get_db)):
+    # 纯只读：只用已存的新 schema 生成确定性单点变异，绝不修改分析或画像历史
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    result = mutation.evaluate_mutation_coverage(
+        row.new_schema,
+        payload.documents,
+        dict(payload.max_mutations) if payload.max_mutations is not None else None,
     )
     return {"analysis_id": analysis_id, **result}
 

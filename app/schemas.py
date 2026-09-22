@@ -3,6 +3,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.mutation import (
+    DEFAULT_MAX_MUTATIONS_PER_RULE,
+    MAX_MUTATION_DOCUMENTS,
+    MAX_MUTATIONS_PER_RULE_LIMIT,
+    MUTATION_RULES,
+)
 from app.profile import MAX_PROFILE_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
 
@@ -383,4 +389,100 @@ class ReplayResponse(BaseModel):
     )
     unattributed: list[ReplayUnattributedError] = Field(
         ..., description="无法归因到报告 issue 的校验错误分组"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/mutation-coverage 样本变异覆盖评估
+# ---------------------------------------------------------------------------
+
+
+class MutationCoverageRequest(BaseModel):
+    """POST /api/analyses/{id}/mutation-coverage 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_MUTATION_DOCUMENTS,
+        description=(
+            f"待评估的 JSON 文档列表（任意 JSON 类型），数量 1..{MAX_MUTATION_DOCUMENTS}"
+        ),
+    )
+    max_mutations: dict[str, int] | None = Field(
+        default=None,
+        description=(
+            "每类变异规则的生成上限；未声明的规则使用缺省上限 "
+            f"{DEFAULT_MAX_MUTATIONS_PER_RULE}，单类上限不得超过 "
+            f"{MAX_MUTATIONS_PER_RULE_LIMIT}"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_max_mutations(self):
+        if self.max_mutations:
+            valid_rules = set(MUTATION_RULES)
+            for rule, cap in self.max_mutations.items():
+                if rule not in valid_rules:
+                    raise ValueError(
+                        f"未知变异规则: {rule}（合法值: {', '.join(MUTATION_RULES)}）"
+                    )
+                if cap < 0:
+                    raise ValueError(f"max_mutations.{rule} 不能为负数")
+                if cap > MAX_MUTATIONS_PER_RULE_LIMIT:
+                    raise ValueError(
+                        f"max_mutations.{rule} 不能超过 {MAX_MUTATIONS_PER_RULE_LIMIT}"
+                    )
+        return self
+
+
+class MutationRuleScore(BaseModel):
+    """按变异规则分类的覆盖统计。"""
+
+    rule: str = Field(..., description="变异规则代码")
+    generated: int = Field(..., ge=0, description="该规则实际生成的变异数量（已按上限截断）")
+    killed: int = Field(..., ge=0, description="被待评估文档发现（杀死）的变异数量")
+    survived: int = Field(..., ge=0, description="未被任何文档发现的变异数量")
+    mutation_score: float = Field(..., description="该规则的 mutation score：killed / generated")
+    cap: int = Field(..., ge=0, description="该规则本次评估使用的生成上限")
+
+
+class MutationResult(BaseModel):
+    """单个变异的评估结果。"""
+
+    rule: str = Field(..., description="变异规则代码")
+    path: str = Field(..., description="变异施加位置（schema JSON Pointer，根为 #）")
+    description: str = Field(..., description="单点变异的确定性中文说明")
+    killed: bool = Field(..., description="是否被待评估文档发现（合法性发生翻转）")
+    sample_indices: list[int] = Field(
+        ..., description="发现该变异的样例下标（基于提交顺序，从 0 开始，升序且有界）"
+    )
+
+
+class UncoveredMutation(BaseModel):
+    """未被任何样例发现的变异（只含定位信息，不含样例下标）。"""
+
+    rule: str
+    path: str
+    description: str
+
+
+class MutationCoverageResponse(BaseModel):
+    """样本变异覆盖评估结果（接口只读，不持久化）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=1)
+    valid_documents: int = Field(..., ge=0, description="在原 schema 下合法的文档数")
+    invalid_documents: int = Field(..., ge=0, description="在原 schema 下非法的文档数")
+    total_mutations: int = Field(..., ge=0, description="全部规则实际生成的变异总数")
+    killed_mutations: int = Field(..., ge=0, description="被样例发现的变异总数")
+    survived_mutations: int = Field(..., ge=0, description="未被发现的变异总数")
+    mutation_score: float = Field(..., description="整体 mutation score：killed / total")
+    rules: list[MutationRuleScore] = Field(
+        ..., description="按规则分类的 mutation score（仅包含实际生成过变异的规则）"
+    )
+    mutations: list[MutationResult] = Field(
+        ..., description="全部变异的逐变异评估结果（规则 -> path -> 描述 的确定顺序）"
+    )
+    uncovered: list[UncoveredMutation] = Field(
+        ..., description="未覆盖变异清单（规则 + schema 路径 + 说明）"
     )
